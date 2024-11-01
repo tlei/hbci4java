@@ -65,6 +65,7 @@ import org.kapott.hbci.security.Crypt;
 import org.kapott.hbci.security.Sig;
 import org.kapott.hbci.status.HBCIMsgStatus;
 import org.kapott.hbci.status.HBCIRetVal;
+import org.kapott.hbci.status.HBCIStatus;
 import org.kapott.hbci.structures.Konto;
 import org.kapott.hbci.tools.CryptUtils;
 import org.kapott.hbci.tools.NumberUtil;
@@ -102,11 +103,6 @@ public abstract class AbstractPinTanPassport extends AbstractHBCIPassport
      */
     public final static String KEY_PD_ORDERREF = "__pintan_orderref___";
 
-    /**
-     * Hier speichern wir zwischen, ob es sich um ein Decoupled-Verfahren handelt
-     */
-    public final static String KEY_PD_DECOUPLED = "__pintan_decoupled__";
-
     private String certfile;
     private boolean checkCert;
 
@@ -129,6 +125,9 @@ public abstract class AbstractPinTanPassport extends AbstractHBCIPassport
     private Hashtable<String,Properties> tanMethodsBank;
 
     private String pin;
+
+    // Die bisherige Anzahl von decoupled status refresh requests
+    protected int decoupledRefreshes = 0;
     
     /**
      * ct.
@@ -419,11 +418,16 @@ public abstract class AbstractPinTanPassport extends AbstractHBCIPassport
      * Prueft, ob die Dialog-Initialisierung um ein HKTAN erweitert werden muss.
      * @param ctx der Kontext.
      */
-    private  void checkSCARequest(DialogContext ctx)
+    private void checkSCARequest(DialogContext ctx)
     {
+        HBCIUtils.log("check SCA request",HBCIUtils.LOG_DEBUG);
+
         final SCARequest sca = this.getSCARequest(ctx);
         if (sca == null)
-            return;
+        {
+          HBCIUtils.log("no SCA request for this context, skipping check",HBCIUtils.LOG_DEBUG);
+          return;
+        }
         
         Integer step = (Integer) ctx.getMeta().get(CACHE_KEY_SCA_STEP);
 
@@ -437,15 +441,28 @@ public abstract class AbstractPinTanPassport extends AbstractHBCIPassport
         final Variant variant = sca.getVariant();
         KnownTANProcess tp = KnownTANProcess.get(variant,step.intValue());
 
-        // Checken, ob wir Decoupled verwenden. In dem Fall
-        // TAN-Prozess von "2" auf "S" ändern
         if (tp == KnownTANProcess.PROCESS2_STEP2)
         {
-          final String dec = (String) ctx.getPassport().getPersistentData(KEY_PD_DECOUPLED);
-          if (dec != null && dec.length() > 0)
+          // Checken, ob wir Decoupled verwenden. In dem Fall
+          // TAN-Prozess von "2" auf "S" ändern
+          final Properties secmechInfo = this.getCurrentSecMechInfo();
+          final HHDVersion hhd = HHDVersion.find(secmechInfo);
+          final String segversion = secmechInfo != null ? secmechInfo.getProperty("segversion") : null;
+          HBCIUtils.log("detected HHD version: " + hhd,HBCIUtils.LOG_DEBUG);
+
+          if (hhd != null && hhd.getType() == Type.DECOUPLED)
           {
-            tp = KnownTANProcess.PROCESS2_STEPS;
-            ctx.getPassport().setPersistentData(KEY_PD_DECOUPLED,null);
+            Integer i = null;
+            try
+            {
+              i = Integer.parseInt(segversion);
+            }
+            catch (Exception e) {}
+            if (i != null && i.intValue() >= 7)
+            {
+              HBCIUtils.log("switching TAN process from " + tp + " to " + KnownTANProcess.PROCESS2_STEPS,HBCIUtils.LOG_DEBUG);
+              tp = KnownTANProcess.PROCESS2_STEPS;
+            }
           }
         }
         
@@ -487,13 +504,21 @@ public abstract class AbstractPinTanPassport extends AbstractHBCIPassport
      */
     private SCARequest getSCARequest(DialogContext ctx)
     {
+        HBCIUtils.log("create new SCA request",HBCIUtils.LOG_DEBUG);
+        
         final RawHBCIDialog init = ctx.getDialogInit();
         if (init == null)
-            return null;
+        {
+          HBCIUtils.log("have no dialog init, skip SCA request creation",HBCIUtils.LOG_DEBUG);
+          return null;
+        }
 
         // Checken, ob es ein Dialog, in dem eine SCA gemacht werden soll
         if (!KnownDialogTemplate.LIST_SEND_SCA.contains(init.getTemplate()))
-            return null;
+        {
+          HBCIUtils.log("dialog (" + init.getTemplate() + ") not in list of SCA dialogs, skip SCA request creation",HBCIUtils.LOG_DEBUG);
+          return null;
+        }
 
         if (Feature.PINTAN_INIT_SKIPONESTEPSCA.isEnabled())
         {
@@ -513,10 +538,11 @@ public abstract class AbstractPinTanPassport extends AbstractHBCIPassport
             //  Sync mit aktiviertem Init-Flip           ja
           
             final KnownDialogTemplate tpl = init.getTemplate();
-            if (!ctx.isAnonymous() && Objects.equals(TanMethod.ONESTEP.getId(),this.getCurrentTANMethod(false)) && 
+            final String currentTanMethod = this.getCurrentTANMethod(false);
+            if (!ctx.isAnonymous() && Objects.equals(TanMethod.ONESTEP.getId(),currentTanMethod) && 
                 (tpl == KnownDialogTemplate.INIT || (Feature.INIT_FLIP_USER_INST.isEnabled() && tpl == KnownDialogTemplate.SYNC)))
             {
-                HBCIUtils.log("skipping HKTAN for dialog init",HBCIUtils.LOG_DEBUG);
+                HBCIUtils.log("skipping HKTAN for dialog init [anon: " + ctx.isAnonymous() + ", current tan method: " + currentTanMethod + ", tpl: " + tpl + "]",HBCIUtils.LOG_DEBUG);
                 return null;
             }
         }
@@ -530,11 +556,17 @@ public abstract class AbstractPinTanPassport extends AbstractHBCIPassport
         // Erst ab HKTAN 6 noetig. Die Bank unterstuetzt es scheinbar noch nicht
         // Siehe B.4.3.1 - Wenn die Bank HITAN < 6 geschickt hat, dann kann sie keine SCA
         if (hktanVersion < 6)
-            return null;
+        {
+          HBCIUtils.log("HKTAN version < 6, skip SCA request creation",HBCIUtils.LOG_DEBUG);
+          return null;
+        }
 
         final SCARequest r = init.createSCARequest(secmechInfo,hktanVersion);
         if (r == null)
+        {
+          HBCIUtils.log("have no SCA request, skip SCA request creation",HBCIUtils.LOG_DEBUG);
           return null;
+        }
         
         if (r.getTanReference() == null)
         {
@@ -573,13 +605,21 @@ public abstract class AbstractPinTanPassport extends AbstractHBCIPassport
      */
     private void checkSCAResponse(DialogContext ctx)
     {
+        HBCIUtils.log("check SCA response",HBCIUtils.LOG_DEBUG);
+        
         final RawHBCIDialog init = ctx.getDialogInit();
         if (init == null)
-            return;
+        {
+          HBCIUtils.log("no init dialog, skip SCA response analysis",HBCIUtils.LOG_DEBUG);
+          return;
+        }
         
         // Checken, ob es ein Dialog, in dem eine SCA gemacht werden soll
         if (!KnownDialogTemplate.LIST_SEND_SCA.contains(init.getTemplate()))
-            return;
+        {
+          HBCIUtils.log("dialog (" + init.getTemplate() + ") not in list of SCA dialogs, skip SCA response analysis",HBCIUtils.LOG_DEBUG);
+          return;
+        }
 
         // Wenn wir noch in der anonymen Dialog-Initialisierung sind, interessiert uns das nicht.
         if (ctx.isAnonymous() || this.isAnonymous())
@@ -593,12 +633,18 @@ public abstract class AbstractPinTanPassport extends AbstractHBCIPassport
         
         // Wenn wir keinen SCA-Request gesendet haben, brauchen wir auch nicht nach dem Response suchen
         if (scaStep == null)
-            return;
+        {
+          HBCIUtils.log("no sca request sent, skip SCA response analysis",HBCIUtils.LOG_DEBUG);
+          return;
+        }
 
         // Ohne Status brauchen wir es gar nicht erst versuchen
         final HBCIMsgStatus status = ctx.getMsgStatus();
         if (status == null)
-            return;
+        {
+          HBCIUtils.log("no message status received, skip SCA response analysis",HBCIUtils.LOG_DEBUG);
+          return;
+        }
 
         // Bank hat uns eine Ausnahme erteilt - wir brauchen keine TAN
         if (status.segStatus != null && (KnownReturncode.W3076.searchReturnValue(status.segStatus.getWarnings()) != null || KnownReturncode.W3076.searchReturnValue(status.globStatus.getWarnings()) != null))
@@ -615,7 +661,10 @@ public abstract class AbstractPinTanPassport extends AbstractHBCIPassport
 
             Properties props = ParameterFinder.find(status.getData(),"TAN2StepRes*.");
             if (props == null || props.size() == 0)
-                return; // Wir haben kein HITAN
+            {
+              HBCIUtils.log("no hitan reponse data found",HBCIUtils.LOG_DEBUG);
+              return; // Wir haben kein HITAN
+            }
 
             // HITAN erhalten - Daten uebernehmen
             HBCIUtils.log("SCA HITAN response found, triggering TAN request",HBCIUtils.LOG_DEBUG);
@@ -645,12 +694,68 @@ public abstract class AbstractPinTanPassport extends AbstractHBCIPassport
         
         if (scaStep.intValue() == 2)
         {
+            if (this.shouldPerformDecoupledRefresh(status.segStatus)) {
+                HBCIUtils.log("Decoupled refresh required for dialog initialization. Repeating dialog",HBCIUtils.LOG_DEBUG);
+                ctx.getMeta().put(CACHE_KEY_SCA_STEP,2);
+                ctx.getDialogInit().setTemplate(KnownDialogTemplate.INIT_SCA);
+                ctx.setRepeat(true);
+                return;
+            }
             ctx.getMeta().remove(CACHE_KEY_SCA_STEP); // Geschafft
             HBCIUtils.log("HKTAN step 2 for SCA sent, checking for HITAN response [step: " + scaStep + "]",HBCIUtils.LOG_DEBUG);
             Properties props = ParameterFinder.find(status.getData(),"TAN2StepRes*.");
             if (props.size() > 0)
                 HBCIUtils.log("final SCA HITAN response found",HBCIUtils.LOG_DEBUG);
         }
+    }
+
+    /**
+     * Beim Decoupled Verfahren kann die Bank ein 3956 senden, wenn der Nutzer den Prozess noch nicht bestätigt hat.
+     * In diesem Fall muss die Nachricht wiederholt werden, um erneut zu prüfen, ob die Bestätigung erfolgt ist.
+     * Wir benachrichtigen die Applikation mit einem entsprechenden Callback und warten eine mögliche Mindestzeit.
+     * Ein refresh kann entweder durch die Dialoginitialisierung in {@link #checkSCAResponse},
+     * oder von konkreten Geschäftsvorfällen in {@link GVTAN2Step#extractResults(HBCIMsgStatus, String, int)}
+     * ausgelöst werden.
+     * @param segStatus Der segStatus, wo ein möglicher 3956 response code zu finden ist.
+     * @return true, wenn ein 3956 code gefunden wurde, und ein refresh durchgeführt werden soll.
+     */
+    public boolean shouldPerformDecoupledRefresh(HBCIStatus segStatus) {
+        if (segStatus == null || (KnownReturncode.W3956.searchReturnValue(segStatus.getWarnings()) == null)) {
+            return false;
+        }
+        if (!Feature.PINTAN_DECOUPLED_REFRESH.isEnabled()) {
+            HBCIUtils.log("found status code 3956, but PINTAN_DECOUPLED_REFRESH is disabled, so no refresh will be performed", HBCIUtils.LOG_DEBUG);
+            return false;
+        }
+
+        HBCIUtils.log("found status code 3956, calling decoupled callback", HBCIUtils.LOG_DEBUG);
+        if (this.getDecoupledMaxRefreshes() != null && this.decoupledRefreshes >= this.getDecoupledMaxRefreshes()) {
+            throw new HBCI_Exception("*** the maximum number of decoupled refreshes has been reached.");
+        }
+        Integer timeBeforeDecoupledRefresh = this.decoupledRefreshes == 0
+            ? this.getMinimumTimeBeforeFirstDecoupledRefresh()
+            : this.getMinimumTimeBeforeNextDecoupledRefresh();
+        long callbackDurationMs = System.currentTimeMillis();
+        HBCIUtilsInternal.getCallback().callback(
+            this,
+            HBCICallback.NEED_PT_DECOUPLED_RETRY,
+            "*** decoupled SCA still required",
+            HBCICallback.TYPE_TEXT,
+            new StringBuffer(String.valueOf(timeBeforeDecoupledRefresh != null ? timeBeforeDecoupledRefresh : 0)));
+        callbackDurationMs = System.currentTimeMillis() - callbackDurationMs;
+        if (timeBeforeDecoupledRefresh != null && callbackDurationMs < timeBeforeDecoupledRefresh * 1000) {
+            long sleepMs = timeBeforeDecoupledRefresh * 1000 - callbackDurationMs;
+            HBCIUtils.log(String.format(
+                "The pause before the next decoupled request was too short. Sleeping for %dms to reach the required delay.", sleepMs
+            ), HBCIUtils.LOG_INFO);
+            try {
+                Thread.sleep(sleepMs);
+            } catch (InterruptedException e) {
+                throw new HBCI_Exception("*** Decoupled refresh sleep was interrupted.");
+            }
+        }
+        this.decoupledRefreshes++;
+        return true;
     }
     
     /**
@@ -686,6 +791,39 @@ public abstract class AbstractPinTanPassport extends AbstractHBCIPassport
         return true;
       
       return ParameterFinder.findAll(bpd,ParameterFinder.Query.BPD_PINTAN_CAN1STEP).containsValue("J");
+    }
+
+    /**
+     * Für das Decoupled Verfahren, liefert die minimale Zeit vor dem ersten refresh.
+     * @return Die minimale Zeit vor dem ersten Decoupled refresh.
+     */
+    public Integer getMinimumTimeBeforeFirstDecoupledRefresh() {
+        final Properties bpd = this.getBPD();
+        if (bpd == null)
+            return null;
+        return HBCIUtilsInternal.getIntegerProperty(bpd, Query.BPD_DECOUPLED_TIME_BEFORE_FIRST_STATUS_REQUEST, false);
+    }
+
+    /**
+     * Für das Decoupled Verfahren, liefert die minimale Zeit vor weiteren refreshes.
+     * @return Die minimale Zeit vor weiteren Decoupled refreshes.
+     */
+    public Integer getMinimumTimeBeforeNextDecoupledRefresh() {
+        final Properties bpd = this.getBPD();
+        if (bpd == null)
+            return null;
+        return HBCIUtilsInternal.getIntegerProperty(bpd, Query.BPD_DECOUPLED_TIME_BEFORE_NEXT_STATUS_REQUEST, false);
+    }
+
+    /**
+     * Für das Decoupled Verfahren, liefert die maximale Anzahl von refreshes.
+     * @return Die maximale Anzahl von Decoupled refreshes.
+     */
+    public Integer getDecoupledMaxRefreshes() {
+        final Properties bpd = this.getBPD();
+        if (bpd == null)
+            return null;
+        return HBCIUtilsInternal.getIntegerProperty(bpd, Query.BPD_DECOUPLED_MAX_STATUS_REQUESTS, true);
     }
     
     /** Kann vor <code>new HBCIHandler()</code> aufgerufen werden, um zu
@@ -1561,8 +1699,17 @@ public abstract class AbstractPinTanPassport extends AbstractHBCIPassport
                     HBCIUtils.log("detected HHD version: " + hhd,HBCIUtils.LOG_DEBUG);
                     if (hhd.getType() == Type.DECOUPLED)
                     {
-                      HBCIUtils.log("using decoupled hktan for step 2",HBCIUtils.LOG_INFO);
-                      proc = KnownTANProcess.PROCESS2_STEPS;
+                      Integer i = null;
+                      try
+                      {
+                        i = Integer.parseInt(segversion);
+                      }
+                      catch (Exception e) {}
+                      if (i != null && i.intValue() >= 7)
+                      {
+                        HBCIUtils.log("using decoupled hktan for step 2",HBCIUtils.LOG_DEBUG);
+                        proc = KnownTANProcess.PROCESS2_STEPS;
+                      }
                     }
 
                     // HKTAN-job für das Einreichen der TAN erzeugen
